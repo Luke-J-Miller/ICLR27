@@ -522,6 +522,35 @@ def feature_matrices(block_lists_by_realisation, block, float_type=np.float32):
     return matrices, list(vocabulary)
 
 
+def block_vocabulary(block_list, block, min_support, max_columns):
+    """Keys of a dict block that are nonzero on at least min_support rows, ordered by support, at most max_columns of them"""
+    support = {}
+    for r in block_list:
+        for key, value in r[block].items():
+            if value != 0:
+                support[key] = support.get(key, 0) + 1
+    kept = sorted((key for key, rows_with in support.items() if rows_with >= min_support), key=lambda key: (-support[key], str(key)))[:max_columns]
+    return kept, len(support)
+
+
+def block_matrix(block_list, block, vocabulary=None, width=None, float_type=np.float32):
+    """Dense matrix of one realisation of a block: dict blocks over a fixed vocabulary (keys outside it are dropped), array blocks padded to width"""
+    if vocabulary is None:
+        matrix = np.zeros((len(block_list), width), dtype=float_type)
+        for row, r in enumerate(block_list):
+            values = r[block][:width]
+            matrix[row, :len(values)] = values
+        return matrix
+    column_of = {key: column for column, key in enumerate(vocabulary)}
+    matrix = np.zeros((len(block_list), len(vocabulary)), dtype=float_type)
+    for row, r in enumerate(block_list):
+        for key, value in r[block].items():
+            column = column_of.get(key)
+            if column is not None:
+                matrix[row, column] = value
+    return matrix
+
+
 def audit_construction(construction, lift, census, arm_name, seed):
     """Qiskit against the dense simulation, and relabeling invariance of the blocks; raises on failure"""
     probabilities = probabilities_of(construction)
@@ -1088,6 +1117,69 @@ def count_tanimoto(first, second):
     minima = sum(min(first.get(k, 0), second.get(k, 0)) for k in keys)
     maxima = sum(max(first.get(k, 0), second.get(k, 0)) for k in keys)
     return minima / maxima if maxima else 1.0
+
+
+# ---------------- producer storage: incremental, sparse, one file per realisation ----------------
+
+def save_realisation(path, dense_blocks, sparse_blocks):
+    """Write one realisation of an arm: dense blocks as arrays, dict blocks as (rows, cols, vals) triplets over the arm's vocabulary"""
+    payload = {}
+    for block, matrix in dense_blocks.items():
+        payload[f"{block}__dense"] = np.asarray(matrix, dtype=np.float32)
+    for block, (rows, cols, vals) in sparse_blocks.items():
+        payload[f"{block}__rows"] = np.asarray(rows, dtype=np.int32)
+        payload[f"{block}__cols"] = np.asarray(cols, dtype=np.int32)
+        payload[f"{block}__vals"] = np.asarray(vals, dtype=np.float32)
+    np.savez_compressed(path, **payload)
+
+
+class ArmReadouts:
+    """Reader for one arm of the producer: the arm index holds settings, rows, and the block vocabularies; each realisation is one npz.
+
+    block(realisation, name) returns a dense matrix over the arm's full vocabulary. For the wide occupancy-keyed blocks pass
+    min_support and max_columns to keep only keys nonzero on at least min_support molecules in the exact realisation, at
+    most max_columns of them by support; the choice is the consumer's and the producer keeps everything.
+    """
+
+    def __init__(self, producer_dir, arm_name):
+        self.producer_dir = producer_dir
+        self.arm_name = arm_name
+        self.index = load_pickle(f"{producer_dir}/iclr27_x9pcorrected_{arm_name}_index.pkl")
+        self.lift = self.index["lift"]
+        self.setting = self.index["setting"]
+        self.row_positions = np.asarray(self.index["row_positions"])
+        self.vocabularies = self.index["vocabularies"]
+        self.support = self.index["support"]
+        self.widths = self.index["widths"]
+        self.realisations = self.index["realisations"]
+
+    def columns(self, block, min_support=None, max_columns=None):
+        """Indices of the kept columns of a dict block under the support rule; every column when no rule is given"""
+        support = np.asarray(self.support[block])
+        kept = np.arange(len(support)) if min_support is None else np.where(support >= min_support)[0]
+        if max_columns is not None and len(kept) > max_columns:
+            kept = kept[np.argsort(-support[kept], kind="stable")[:max_columns]]
+            kept = np.sort(kept)
+        return kept
+
+    def block(self, realisation, block, min_support=None, max_columns=None):
+        assert realisation in self.realisations, f"{self.arm_name}: no realisation {realisation}"
+        with np.load(f"{self.producer_dir}/iclr27_x9pcorrected_{self.arm_name}_{realisation}.npz") as stored:
+            if f"{block}__dense" in stored:
+                return stored[f"{block}__dense"].astype(float)
+            assert f"{block}__rows" in stored, f"{self.arm_name}: block {block} not stored for {realisation}"
+            rows, cols, vals = stored[f"{block}__rows"], stored[f"{block}__cols"], stored[f"{block}__vals"]
+        kept = self.columns(block, min_support, max_columns)
+        position_of = np.full(len(self.vocabularies[block]), -1, dtype=np.int64)
+        position_of[kept] = np.arange(len(kept))
+        matrix = np.zeros((len(self.row_positions), len(kept)))
+        inside = position_of[cols] >= 0
+        matrix[rows[inside], position_of[cols[inside]]] = vals[inside]
+        return matrix
+
+    def has_block(self, realisation, block):
+        with np.load(f"{self.producer_dir}/iclr27_x9pcorrected_{self.arm_name}_{realisation}.npz") as stored:
+            return f"{block}__dense" in stored or f"{block}__rows" in stored
 
 
 # ---------------- provenance ----------------
