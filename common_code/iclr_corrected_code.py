@@ -583,6 +583,26 @@ def degree_histogram(census, row_positions):
     return np.array([[int((molecules[p]["degrees"] == degree).sum()) for degree in census["degree_classes"]] for p in row_positions], dtype=int)
 
 
+def histogram_onehot(census, row_positions, bucket_id=None, min_support=2):
+    """One-hot columns for the degree-histogram cells, nested in buckets when bucket_id is given, keeping cells with at least min_support rows.
+
+    A linear model on these columns is the degree-histogram category model, so a ridge classical model that includes them
+    can remove any function of the degree sequence the way the residual chain does.
+    """
+    histogram = degree_histogram(census, row_positions)
+    keys = histogram if bucket_id is None else np.hstack([np.asarray(bucket_id)[:, None], histogram])
+    _, inverse, counts = np.unique(keys, axis=0, return_inverse=True, return_counts=True)
+    inverse = inverse.reshape(-1)
+    kept = np.where(counts >= min_support)[0]
+    column_of = {cell: column for column, cell in enumerate(kept)}
+    matrix = np.zeros((len(row_positions), len(kept)))
+    for row, cell in enumerate(inverse):
+        column = column_of.get(int(cell))
+        if column is not None:
+            matrix[row, column] = 1.0
+    return matrix
+
+
 def bank_features(census, row_positions):
     """The geometric bank on the rows, constant columns dropped on these rows"""
     bank = np.array([census["bank_matrix"][census["probe_index_of_position"][p]] for p in row_positions])
