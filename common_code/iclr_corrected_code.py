@@ -867,12 +867,17 @@ class Probe:
         columns = [census["target_names"].index(name) for name in self.target_names]
         self.targets = census["target_matrix"][np.ix_(probe_index, columns)]
 
-    def centre(self, matrix, train_rows, apply_rows):
+    def centre(self, matrix, train_rows, apply_rows, fold=None):
         """The fold-local centring of any row matrix.
 
         A block may be a pair (train_realisation, test_realisation): rows in train_rows are taken from the first matrix
         and every other row from the second, so a sampled readout is fitted on one draw and scored on an independent one.
+        A block may be a dict from outer fold to matrix: the matrix for the current fold is used, which is how nested
+        stacked predictions enter without leaking labels across folds.
         """
+        if isinstance(matrix, dict):
+            assert fold is not None, "a per-fold block needs the outer fold"
+            matrix = matrix[fold]                                    # fold-specific stacked predictions: inner-fold values on training rows, outer-model values on test rows
         if isinstance(matrix, tuple):
             train_matrix, test_matrix = matrix
             combined = np.asarray(test_matrix, dtype=float).copy()
@@ -920,12 +925,22 @@ def block_kernel(features_train, features_test, kernel_name, seed=0):
     return np.exp(-train_sq / (2 * bandwidth ** 2)), np.exp(-test_sq / (2 * bandwidth ** 2))
 
 
+SCALE_FLOOR = 1e-9                                 # a block whose training norm is below this is treated as identically zero, never amplified
+
+
 def scale_block(features_train, features_test):
-    """Scale a block so its training rows have unit mean squared norm; blocks then enter a sum kernel on equal footing"""
+    """Scale a block so its training rows have unit mean squared norm; a block that is numerically zero stays zero"""
     scale = np.sqrt((features_train ** 2).sum(axis=1).mean())
-    if scale <= 0:
-        return features_train, features_test
+    if scale <= SCALE_FLOOR:
+        return np.zeros_like(features_train), np.zeros_like(features_test)
     return features_train / scale, features_test / scale
+
+
+def zero_small(matrix, tolerance=1e-12):
+    """Entries below the tolerance in magnitude set to exactly zero, so floating-point residue is not counted as support"""
+    matrix = np.asarray(matrix, dtype=float).copy()
+    matrix[np.abs(matrix) < tolerance] = 0.0
+    return matrix
 
 
 def fit_fold(probe, outer, blocks, kernel_name, train_rows, test_rows, targets_train, targets_test):
@@ -938,8 +953,8 @@ def fit_fold(probe, outer, blocks, kernel_name, train_rows, test_rows, targets_t
         kernel_train = np.zeros((len(inner_train), len(inner_train)))
         kernel_test = np.zeros((len(inner_test), len(inner_train)))
         for block in blocks:
-            block_train = probe.centre(block, inner_train, inner_train)
-            block_test = probe.centre(block, inner_train, inner_test)
+            block_train = probe.centre(block, inner_train, inner_train, fold=outer)
+            block_test = probe.centre(block, inner_train, inner_test, fold=outer)
             block_train, block_test = scale_block(block_train, block_test)
             k_train, k_test = block_kernel(block_train, block_test, kernel_name)
             kernel_train += k_train
@@ -958,8 +973,8 @@ def fit_fold(probe, outer, blocks, kernel_name, train_rows, test_rows, targets_t
     kernel_train = np.zeros((len(train_rows), len(train_rows)))
     kernel_test = np.zeros((len(test_rows), len(train_rows)))
     for block in blocks:
-        block_train = probe.centre(block, train_rows, train_rows)
-        block_test = probe.centre(block, train_rows, test_rows)
+        block_train = probe.centre(block, train_rows, train_rows, fold=outer)
+        block_test = probe.centre(block, train_rows, test_rows, fold=outer)
         block_train, block_test = scale_block(block_train, block_test)
         k_train, k_test = block_kernel(block_train, block_test, kernel_name)
         kernel_train += k_train
@@ -1349,3 +1364,28 @@ def connected_correlator_blocks(single, pair, construction, lift, census, label)
     for rank, value in enumerate(np.sort(single)[::-1]):
         blocks[(label, "single", rank)] = float(value)
     return blocks
+
+
+def nested_stacking(probe, stack_inner, fit_predict, num_targets):
+    """Fold-specific stacked predictions: for each outer fold, training rows get predictions from inner models fitted inside that fold's
+    training rows, and test rows get the model fitted on all of them. Returns a dict from outer fold to a full row matrix, to be
+    passed as a block; rows never see a prediction made with their own label, and no fold sees another fold's test labels."""
+    by_fold = {}
+    for fold in range(probe.num_outer):
+        train_rows, test_rows = probe.split(fold)
+        matrix = np.full((len(probe.row_positions), num_targets), np.nan)
+        num_inner = int(stack_inner[fold, train_rows].max()) + 1
+        for inner_fold in range(num_inner):
+            inner_train = train_rows[stack_inner[fold, train_rows] != inner_fold]
+            inner_test = train_rows[stack_inner[fold, train_rows] == inner_fold]
+            if len(inner_test) == 0:
+                continue
+            matrix[inner_test] = fit_predict(inner_train, inner_test)
+        matrix[test_rows] = fit_predict(train_rows, test_rows)
+        by_fold[fold] = np.where(np.isnan(matrix), 0.0, matrix)
+    return by_fold
+
+
+def disable_entangler(construction):
+    """The same construction with every RZZ angle set to zero: nodes, edges, classes, and degrees retained, interaction removed"""
+    return {**construction, "edges": [(a, b, 0.0) for a, b, _ in construction["edges"]]}
