@@ -1269,10 +1269,11 @@ def sector_mass_shots(sector_matrix, relative_error=0.05):
 
 # ---------------- deeper circuits and multibasis connected correlators (added for the expressivity and coherence tests) ----------------
 
-def build_circuit_layers(construction, depth, edge_scale, measurement_basis="Z"):
-    """The circuit with `depth` repetitions of (RZZ layer at edge angles times edge_scale, mixer at BETA), then the basis rotation.
+def build_circuit_layers(construction, depth, edge_scale, measurement_basis="Z", mixer_scale=1.0):
+    """The circuit with `depth` repetitions of (RZZ layer at edge angles times edge_scale, mixer at BETA times mixer_scale), then the basis rotation.
 
-    depth 1 and edge_scale 1 reproduce build_circuit exactly.
+    depth 1 with both scales at 1 reproduces build_circuit exactly. Passing mixer_scale = 1 / depth keeps the total mixer action
+    equal to the one-layer circuit's, so depth changes only how finely the interaction and the mixing are interleaved.
     """
     circuit = QuantumCircuit(construction["num_qubits"])
     for qubit, angle in enumerate(construction["node_angles"]):
@@ -1286,9 +1287,9 @@ def build_circuit_layers(construction, depth, edge_scale, measurement_basis="Z")
             circuit.rzz(angle * edge_scale, a, b)
         for qubit in range(construction["num_qubits"]):
             if construction["mixer"] == "X":
-                circuit.rx(BETA, qubit)
+                circuit.rx(BETA * mixer_scale, qubit)
             elif construction["mixer"] == "Y":
-                circuit.ry(BETA, qubit)
+                circuit.ry(BETA * mixer_scale, qubit)
     for qubit in range(construction["num_qubits"]):
         if measurement_basis == "X":
             circuit.h(qubit)
@@ -1300,8 +1301,34 @@ def build_circuit_layers(construction, depth, edge_scale, measurement_basis="Z")
     return circuit
 
 
-def statevector_of_layers(construction, depth, edge_scale):
-    return Statevector(build_circuit_layers(construction, depth, edge_scale, "Z")).data
+def statevector_of_layers(construction, depth, edge_scale, mixer_scale=1.0):
+    return Statevector(build_circuit_layers(construction, depth, edge_scale, "Z", mixer_scale)).data
+
+
+def trigonometric_edge_features(construction, lift, census):
+    """A classical trigonometric expansion of the construction's edge angles, permutation-invariant: sorted cos and sin per edge, their sums
+    pooled by class pair, and cos-cos, sin-sin, and cos-sin products summed over pairs of edges that share a node"""
+    node_class_ids = [class_vocabulary(lift, census).index(global_class_of_node(lift, c)) for c in construction["node_classes"]]
+    features = {}
+    cos_values = np.array([np.cos(angle) for _, _, angle in construction["edges"]])
+    sin_values = np.array([np.sin(angle) for _, _, angle in construction["edges"]])
+    for rank, value in enumerate(np.sort(cos_values)[::-1]):
+        features[("cos", rank)] = float(value)
+    for rank, value in enumerate(np.sort(sin_values)[::-1]):
+        features[("sin", rank)] = float(value)
+    incident = {}
+    for index, (a, b, _) in enumerate(construction["edges"]):
+        key = tuple(sorted((node_class_ids[a], node_class_ids[b])))
+        features[("cos class", key)] = features.get(("cos class", key), 0.0) + float(cos_values[index])
+        features[("sin class", key)] = features.get(("sin class", key), 0.0) + float(sin_values[index])
+        incident.setdefault(a, []).append(index)
+        incident.setdefault(b, []).append(index)
+    for node, edges in incident.items():
+        for e, f in itertools.combinations(sorted(edges), 2):
+            features[("cos cos",)] = features.get(("cos cos",), 0.0) + float(cos_values[e] * cos_values[f])
+            features[("sin sin",)] = features.get(("sin sin",), 0.0) + float(sin_values[e] * sin_values[f])
+            features[("cos sin",)] = features.get(("cos sin",), 0.0) + float(cos_values[e] * sin_values[f] + sin_values[e] * cos_values[f])
+    return features
 
 
 def basis_probabilities(state, construction, measurement_basis):
