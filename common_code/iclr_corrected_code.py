@@ -1250,3 +1250,102 @@ def sector_mass_shots(sector_matrix, relative_error=0.05):
     cumulative = np.cumsum(masses) / masses.sum()
     typical = float(masses[np.searchsorted(cumulative, 0.5)])
     return (1 - typical) / (typical * relative_error ** 2), typical
+
+
+# ---------------- deeper circuits and multibasis connected correlators (added for the expressivity and coherence tests) ----------------
+
+def build_circuit_layers(construction, depth, edge_scale, measurement_basis="Z"):
+    """The circuit with `depth` repetitions of (RZZ layer at edge angles times edge_scale, mixer at BETA), then the basis rotation.
+
+    depth 1 and edge_scale 1 reproduce build_circuit exactly.
+    """
+    circuit = QuantumCircuit(construction["num_qubits"])
+    for qubit, angle in enumerate(construction["node_angles"]):
+        if construction["node_encoding"] == "phase":
+            circuit.h(qubit)
+            circuit.rz(angle, qubit)
+        else:
+            circuit.rx(angle, qubit)
+    for _ in range(depth):
+        for a, b, angle in construction["edges"]:
+            circuit.rzz(angle * edge_scale, a, b)
+        for qubit in range(construction["num_qubits"]):
+            if construction["mixer"] == "X":
+                circuit.rx(BETA, qubit)
+            elif construction["mixer"] == "Y":
+                circuit.ry(BETA, qubit)
+    for qubit in range(construction["num_qubits"]):
+        if measurement_basis == "X":
+            circuit.h(qubit)
+        elif measurement_basis == "Y":
+            circuit.sdg(qubit)
+            circuit.h(qubit)
+        else:
+            assert measurement_basis == "Z", measurement_basis
+    return circuit
+
+
+def statevector_of_layers(construction, depth, edge_scale):
+    return Statevector(build_circuit_layers(construction, depth, edge_scale, "Z")).data
+
+
+def basis_probabilities(state, construction, measurement_basis):
+    """Born probabilities of a stored state in a Pauli basis, by applying the basis rotation to the state"""
+    n = construction["num_qubits"]
+    rotation = QuantumCircuit(n)
+    for qubit in range(n):
+        if measurement_basis == "X":
+            rotation.h(qubit)
+        elif measurement_basis == "Y":
+            rotation.sdg(qubit)
+            rotation.h(qubit)
+    return np.abs(Statevector(state).evolve(rotation).data) ** 2
+
+
+def pauli_moments(probabilities, n):
+    """From a distribution in one Pauli basis: single-site expectations <s_i> and the pair matrix <s_i s_j>, with s = +1 for bit 0 and -1 for bit 1"""
+    bits = ((np.arange(2 ** n)[:, None] >> np.arange(n)) & 1)
+    signs = 1.0 - 2.0 * bits
+    single = probabilities @ signs
+    pair = (signs * probabilities[:, None]).T @ signs
+    return single, pair
+
+
+def cross_moments(state, construction, first_basis, second_basis):
+    """Exact <s^first_i s^second_j> for every ordered pair on the construction's edges, by Pauli action on the statevector"""
+    n = construction["num_qubits"]
+    values = {}
+    for a, b, _ in construction["edges"]:
+        for i, j in ((a, b), (b, a)):
+            circuit = QuantumCircuit(n)
+            getattr(circuit, first_basis.lower())(i)
+            getattr(circuit, second_basis.lower())(j)
+            values[(i, j)] = float(np.real(np.vdot(state, Statevector(state).evolve(circuit).data)))
+    return values
+
+
+def connected_correlator_blocks(single, pair, construction, lift, census, label):
+    """Permutation-invariant features of connected correlators c_ij = <s_i s_j> - <s_i><s_j>: sorted over edges, sorted over all pairs, and pooled by class pair; every entry is zero for a product state.
+
+    Also the sorted single-site expectations, which do not vanish for a product state and are kept as a separate key prefix.
+    """
+    n = construction["num_qubits"]
+    connected = pair - np.outer(single, single)
+    node_class_ids = [class_vocabulary(lift, census).index(global_class_of_node(lift, c)) for c in construction["node_classes"]]
+    blocks = {}
+    edge_values, class_pair_sum = [], {}
+    for a, b, _ in construction["edges"]:
+        value = float(connected[a, b])
+        edge_values.append(value)
+        key = tuple(sorted((node_class_ids[a], node_class_ids[b])))
+        class_pair_sum[key] = class_pair_sum.get(key, 0.0) + value
+    for rank, value in enumerate(sorted(edge_values, reverse=True)):
+        blocks[(label, "edge", rank)] = value
+    all_pairs = sorted((float(connected[i, j]) for i in range(n) for j in range(i + 1, n)), reverse=True)
+    for rank, value in enumerate(all_pairs):
+        blocks[(label, "pair", rank)] = value
+    for key, value in class_pair_sum.items():
+        blocks[(label, "class", key)] = value
+    for rank, value in enumerate(np.sort(single)[::-1]):
+        blocks[(label, "single", rank)] = float(value)
+    return blocks
